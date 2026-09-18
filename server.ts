@@ -1,20 +1,24 @@
 import express from "express";
 import path from "path";
-import { fileURLToPath } from "url";
+import fs from "fs";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 
 dotenv.config();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
 async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json({ limit: "10mb" }));
-  app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+  app.use(express.json({ limit: "50mb" }));
+  app.use(express.urlencoded({ extended: true, limit: "50mb" }));
+
+  // Serve files from subdata folder statically if requested
+  const subdataDir = path.join(process.cwd(), "subdata");
+  if (!fs.existsSync(subdataDir)) {
+    fs.mkdirSync(subdataDir, { recursive: true });
+  }
+  app.use("/subdata", express.static(subdataDir));
 
   // Helper for Lazy Gemini AI initialization
   let aiClient: GoogleGenAI | null = null;
@@ -339,6 +343,215 @@ Responda ESTRITAMENTE em formato JSON válido com a seguinte estrutura sem marca
     });
   });
 
+  // 6. Save request, generated PDF proof, and attached contract into subdata folder
+  app.post("/api/subdata/salvar-solicitacao", (req, res) => {
+    try {
+      const { protocol, formData, pdfBase64, contractBase64, contractName } = req.body;
+
+      if (!protocol) {
+        return res.status(400).json({ error: "Protocolo é obrigatório." });
+      }
+
+      const requestDir = path.join(process.cwd(), "subdata", protocol);
+      if (!fs.existsSync(requestDir)) {
+        fs.mkdirSync(requestDir, { recursive: true });
+      }
+
+      // Save JSON data
+      const jsonPath = path.join(requestDir, `solicitacao-${protocol}.json`);
+      const payload = {
+        protocol,
+        savedAt: new Date().toISOString(),
+        formData,
+        folderPath: `subdata/${protocol}`
+      };
+      fs.writeFileSync(jsonPath, JSON.stringify(payload, null, 2), "utf-8");
+
+      // Save generated PDF proof
+      if (pdfBase64) {
+        const pdfClean = pdfBase64.replace(/^data:application\/pdf;base64,/, "");
+        const pdfBuffer = Buffer.from(pdfClean, "base64");
+        const proofPath = path.join(requestDir, `comprovante-${protocol}.pdf`);
+        fs.writeFileSync(proofPath, pdfBuffer);
+      }
+
+      // Save attached contract PDF/file
+      let savedContractName = null;
+      if (contractBase64) {
+        const cleanContractName = (contractName || "contrato-anexado.pdf").replace(/[^a-zA-Z0-9._-]+/g, "-");
+        const contractClean = contractBase64.replace(/^data:.*?;base64,/, "");
+        const contractBuffer = Buffer.from(contractClean, "base64");
+        const contractPath = path.join(requestDir, `contrato-${cleanContractName}`);
+        fs.writeFileSync(contractPath, contractBuffer);
+        savedContractName = `contrato-${cleanContractName}`;
+      }
+
+      console.log(`[subdata] Arquivos gravados com sucesso na pasta: subdata/${protocol}`);
+
+      return res.json({
+        success: true,
+        protocol,
+        message: `Arquivos salvos com sucesso na pasta /subdata/${protocol}`,
+        folder: `subdata/${protocol}`,
+        files: [
+          `solicitacao-${protocol}.json`,
+          pdfBase64 ? `comprovante-${protocol}.pdf` : null,
+          savedContractName
+        ].filter(Boolean)
+      });
+    } catch (err: any) {
+      console.error("Erro ao salvar arquivos em subdata:", err);
+      return res.status(500).json({ error: err.message || "Erro interno ao salvar arquivos em subdata." });
+    }
+  });
+
+  // 7. List subdata folder contents with full URLs and metadata
+  app.get("/api/subdata/listar", (req, res) => {
+    try {
+      const subdataRoot = path.join(process.cwd(), "subdata");
+      if (!fs.existsSync(subdataRoot)) {
+        return res.json({ items: [] });
+      }
+
+      const host = req.get("host") || "localhost:3000";
+      const protocolScheme = req.protocol || "https";
+      const baseUrl = `${protocolScheme}://${host}`;
+
+      const folders = fs.readdirSync(subdataRoot);
+      const items = folders.map(folderName => {
+        const folderPath = path.join(subdataRoot, folderName);
+        if (fs.statSync(folderPath).isDirectory()) {
+          const files = fs.readdirSync(folderPath).map(fileName => {
+            const filePath = path.join(folderPath, fileName);
+            const stats = fs.statSync(filePath);
+            const relativePath = `subdata/${folderName}/${fileName}`;
+            return {
+              name: fileName,
+              path: relativePath,
+              url: `${baseUrl}/${relativePath}`,
+              sizeBytes: stats.size,
+              createdAt: stats.birthtime || stats.mtime
+            };
+          });
+
+          // Check if json info file exists
+          let requestInfo: any = null;
+          const jsonFile = files.find(f => f.name.endsWith(".json"));
+          if (jsonFile) {
+            try {
+              const raw = fs.readFileSync(path.join(folderPath, jsonFile.name), "utf-8");
+              requestInfo = JSON.parse(raw);
+            } catch (e) {
+              // ignore parse error
+            }
+          }
+
+          return {
+            protocol: folderName,
+            folder: `subdata/${folderName}`,
+            folderUrl: `${baseUrl}/subdata/${folderName}`,
+            requestInfo: requestInfo?.formData || null,
+            files
+          };
+        }
+        return null;
+      }).filter(Boolean);
+
+      return res.json({ items });
+    } catch (err: any) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 8. Dedicated Web Page to browse Subdata Online directly from any browser
+  app.get("/subdata-online", (req, res) => {
+    const subdataRoot = path.join(process.cwd(), "subdata");
+    let folders: string[] = [];
+    if (fs.existsSync(subdataRoot)) {
+      folders = fs.readdirSync(subdataRoot);
+    }
+
+    const host = req.get("host") || "";
+    const baseUrl = `${req.protocol}://${host}`;
+
+    let htmlContent = `
+    <!DOCTYPE html>
+    <html lang="pt-BR">
+    <head>
+      <meta charset="UTF-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <title>Forma Vale · Drive Subdata Online</title>
+      <style>
+        body { font-family: system-ui, -apple-system, sans-serif; background: #f4f7f8; color: #101820; margin: 0; padding: 24px; }
+        .container { max-width: 900px; margin: 0 auto; background: white; border-radius: 16px; border: 1px solid #dae2e8; padding: 28px; box-shadow: 0 10px 30px rgba(0,0,0,0.06); }
+        .header { display: flex; align-items: center; justify-content: space-between; border-bottom: 2px solid #0f4c5c; padding-bottom: 16px; margin-bottom: 24px; }
+        .title { color: #0f4c5c; margin: 0; font-size: 22px; font-weight: 700; }
+        .badge { background: #e8f4f6; color: #0f4c5c; padding: 4px 12px; border-radius: 999px; font-weight: 600; font-size: 13px; }
+        .folder-card { background: #f8fafb; border: 1px solid #e1e8ed; border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+        .folder-title { font-weight: 700; font-size: 16px; color: #0f4c5c; margin-bottom: 8px; display: flex; align-items: center; justify-content: space-between; }
+        .file-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+        .file-btn { display: inline-flex; align-items: center; gap: 6px; background: white; border: 1px solid #0f4c5c; color: #0f4c5c; padding: 8px 14px; border-radius: 8px; font-size: 13px; font-weight: 600; text-decoration: none; transition: all 0.2s; }
+        .file-btn:hover { background: #0f4c5c; color: white; }
+        .empty { text-align: center; padding: 40px; color: #61707d; font-size: 15px; }
+        .btn-home { background: #0f4c5c; color: white; padding: 10px 18px; border-radius: 8px; text-decoration: none; font-weight: 600; font-size: 14px; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="header">
+          <div>
+            <h1 class="title">📁 Drive Online · Pasta Subdata</h1>
+            <p style="margin: 4px 0 0 0; color: #61707d; font-size: 13px;">Repositório online de solicitações, PDFs de contratos e comprovantes</p>
+          </div>
+          <a href="/" class="btn-home">⬅ Voltar para o App</a>
+        </div>
+    `;
+
+    if (folders.length === 0) {
+      htmlContent += `
+        <div class="empty">
+          Nenhuma solicitação gravada na pasta <strong>/subdata</strong> até o momento.<br/>
+          Envie um formulário na aplicação para visualizar os arquivos online aqui.
+        </div>
+      `;
+    } else {
+      folders.forEach(protocol => {
+        const folderPath = path.join(subdataRoot, protocol);
+        if (fs.statSync(folderPath).isDirectory()) {
+          const files = fs.readdirSync(folderPath);
+          htmlContent += `
+            <div class="folder-card">
+              <div class="folder-title">
+                <span>📂 Protocolo: ${protocol}</span>
+                <span class="badge">${files.length} arquivo(s)</span>
+              </div>
+              <div class="file-list">
+          `;
+          files.forEach(file => {
+            const fileUrl = `${baseUrl}/subdata/${protocol}/${file}`;
+            htmlContent += `
+              <a href="${fileUrl}" target="_blank" class="file-btn" download>
+                📥 ${file}
+              </a>
+            `;
+          });
+          htmlContent += `
+              </div>
+            </div>
+          `;
+        }
+      });
+    }
+
+    htmlContent += `
+      </div>
+    </body>
+    </html>
+    `;
+
+    res.send(htmlContent);
+  });
+
   // Vite middleware for development / static server for production
   if (process.env.NODE_ENV !== "production") {
     const { createServer: createViteServer } = await import("vite");
@@ -348,7 +561,7 @@ Responda ESTRITAMENTE em formato JSON válido com a seguinte estrutura sem marca
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(__dirname, "dist");
+    const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
     app.get("*", (_req, res) => {
       res.sendFile(path.join(distPath, "index.html"));

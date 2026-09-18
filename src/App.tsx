@@ -60,6 +60,19 @@ export default function App() {
   const [lastProtocol, setLastProtocol] = useState<string | null>(null);
   const [lastPdfBlob, setLastPdfBlob] = useState<Blob | null>(null);
 
+  const [showSubdataModal, setShowSubdataModal] = useState<boolean>(false);
+  const [subdataList, setSubdataList] = useState<Array<{ protocol: string; folder: string; files: string[] }>>([]);
+
+  const fetchSubdataList = async () => {
+    try {
+      const res = await fetch('/api/subdata/listar');
+      const data = await res.json();
+      setSubdataList(data.items || []);
+    } catch (err) {
+      console.warn('Erro ao carregar subdata:', err);
+    }
+  };
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messageRef = useRef<HTMLDivElement>(null);
 
@@ -236,6 +249,15 @@ export default function App() {
     }
   };
 
+  const fileToBase64 = (blob: Blob): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(reader.result as string);
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  };
+
   const uploadAndSave = async () => {
     const protocol = makeProtocol();
     const originalFile = formData.contract_file;
@@ -246,7 +268,41 @@ export default function App() {
 
     const pdfBlob = makePdf(protocol);
 
-    // Try Supabase upload with fallback
+    // 1. Save locally to server's 'subdata' directory
+    try {
+      const pdfBase64 = await fileToBase64(pdfBlob);
+      const contractBase64 = file ? await fileToBase64(file) : null;
+
+      await fetch('/api/subdata/salvar-solicitacao', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          protocol,
+          formData: {
+            full_name: formData.full_name,
+            email: formData.email,
+            whatsapp: formData.whatsapp,
+            institution: formData.institution,
+            course_class: formData.course_class,
+            completion_date: formData.completion_date,
+            pending_material: formData.pending_material,
+            material_situation: formData.material_situation,
+            pending_description: formData.pending_description,
+            no_contract: formData.no_contract,
+            consent: formData.consent,
+            contract_file_name: file?.name || null
+          },
+          pdfBase64,
+          contractBase64,
+          contractName: file?.name || null
+        })
+      });
+      console.log(`[subdata] Solicitação ${protocol} enviada e salva com sucesso no servidor em /subdata/${protocol}`);
+    } catch (subdataErr) {
+      console.warn('Subdata save warning:', subdataErr);
+    }
+
+    // 2. Try Supabase upload with fallback
     try {
       if (file && contractPath) {
         await supabase.storage.from('documentos').upload(contractPath, file, { contentType: 'application/pdf', upsert: false });
@@ -393,7 +449,19 @@ export default function App() {
             <span>Central de solicitação de materiais</span>
           </div>
         </div>
-        <div className="privacy">Documentos protegidos</div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            className="subdata-btn-top"
+            onClick={() => {
+              setShowSubdataModal(true);
+              fetchSubdataList();
+            }}
+          >
+            📁 Acessar Pasta Subdata
+          </button>
+          <div className="privacy">Documentos protegidos</div>
+        </div>
       </header>
 
       {/* Hero Section */}
@@ -705,9 +773,57 @@ export default function App() {
             <div className="protocol" id="protocol">
               {lastProtocol}
             </div>
+
+            {/* Direct Links to Subdata Files */}
+            {lastProtocol && (
+              <div className="my-6 p-4 bg-slate-50 border border-slate-200 rounded-xl text-left max-w-lg mx-auto">
+                <div className="text-xs font-bold text-slate-700 uppercase tracking-wider mb-2 flex items-center gap-1.5">
+                  📂 Links Diretos da Pasta Subdata (Servidor):
+                </div>
+                <div className="flex flex-col gap-2 text-xs">
+                  <a
+                    href={`/subdata/${lastProtocol}/solicitacao-${lastProtocol}.json`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="subdata-file-link"
+                  >
+                    📄 Ver JSON do Registro (`solicitacao-{lastProtocol}.json`)
+                  </a>
+                  <a
+                    href={`/subdata/${lastProtocol}/comprovante-${lastProtocol}.pdf`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="subdata-file-link"
+                  >
+                    📕 Ver PDF Comprovante (`comprovante-{lastProtocol}.pdf`)
+                  </a>
+                  {formData.contract_file && (
+                    <a
+                      href={`/subdata/${lastProtocol}/contrato-${safeName(formData.contract_file.name)}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="subdata-file-link"
+                    >
+                      📑 Ver PDF Contrato Anexado (`contrato-{formData.contract_file.name}`)
+                    </a>
+                  )}
+                </div>
+              </div>
+            )}
+
             <div className="flex flex-wrap justify-center gap-3 mt-4">
               <button className="btn btn-secondary" id="download-again" type="button" onClick={handleDownloadAgain}>
                 Baixar comprovante novamente
+              </button>
+              <button
+                className="btn btn-primary"
+                type="button"
+                onClick={() => {
+                  setShowSubdataModal(true);
+                  fetchSubdataList();
+                }}
+              >
+                📁 Abrir Repositório /subdata
               </button>
               <button className="btn btn-ghost" id="new-request" type="button" onClick={handleNewRequest}>
                 Registrar outra solicitação
@@ -716,6 +832,102 @@ export default function App() {
           </div>
         )}
       </section>
+
+      {/* Subdata Explorer Modal */}
+      {showSubdataModal && (
+        <div className="subdata-modal-backdrop" onClick={() => setShowSubdataModal(false)}>
+          <div className="subdata-modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="subdata-modal-header">
+              <div>
+                <strong className="text-lg">📁 Repositório de Arquivos /subdata</strong>
+                <p className="text-xs opacity-80 font-normal">Pastas de solicitações, PDFs e JSONs gravados no servidor</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowSubdataModal(false)}
+                className="text-white hover:opacity-75 font-bold text-xl px-2"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="subdata-modal-body">
+              <div className="mb-4 p-3 bg-emerald-50 border border-emerald-200 rounded-lg flex items-center justify-between">
+                <div>
+                  <span className="text-xs font-bold text-emerald-900 block">Página Web Online de Arquivos:</span>
+                  <span className="text-xs text-emerald-700">Acesse via navegador direto no link /subdata-online</span>
+                </div>
+                <a
+                  href="/subdata-online"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="bg-emerald-700 text-white text-xs font-semibold px-3 py-1.5 rounded-md hover:bg-emerald-800 transition-colors"
+                >
+                  🌐 Abrir Página /subdata-online
+                </a>
+              </div>
+
+              {subdataList.length === 0 ? (
+                <div className="text-center py-10 text-slate-500 text-sm">
+                  <p className="font-semibold text-slate-700">Nenhum arquivo gravado na pasta /subdata ainda.</p>
+                  <p className="text-xs mt-1">Envie uma solicitação no formulário para gerar a primeira pasta.</p>
+                </div>
+              ) : (
+                subdataList.map((item) => (
+                  <div key={item.protocol} className="subdata-folder-item">
+                    <div className="flex items-center justify-between mb-2">
+                      <strong className="text-sm text-slate-800 flex items-center gap-1.5">
+                        📂 Protocolo: {item.protocol}
+                      </strong>
+                      <span className="text-xs bg-slate-200 text-slate-700 px-2 py-0.5 rounded-full font-medium">
+                        {item.files.length} arquivo(s)
+                      </span>
+                    </div>
+
+                    <div className="flex flex-wrap gap-2 mt-2">
+                      {item.files.map((fileObj: any, fIdx: number) => {
+                        const fileName = typeof fileObj === 'string' ? fileObj : fileObj.name;
+                        const fileUrl = typeof fileObj === 'string' ? `/${item.folder}/${fileObj}` : (fileObj.url || `/${fileObj.path}`);
+                        return (
+                          <a
+                            key={fileName || fIdx}
+                            href={fileUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="subdata-file-link"
+                          >
+                            🔗 {fileName}
+                          </a>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div className="p-4 bg-slate-100 border-t border-slate-200 flex justify-between items-center">
+              <a
+                href="/subdata-online"
+                target="_blank"
+                rel="noreferrer"
+                className="text-xs font-semibold text-teal-800 hover:underline"
+              >
+                🌐 Abrir Drive Subdata Online em Nova Guia
+              </a>
+              <button
+                type="button"
+                className="btn btn-secondary text-xs"
+                onClick={() => setShowSubdataModal(false)}
+              >
+                Fechar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Footer */}
 
       {/* Footer */}
       <footer className="footer">
